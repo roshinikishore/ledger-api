@@ -1,0 +1,221 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Transaction Ledger</title>
+<style>
+  :root { --bg:#f6f7f9; --card:#fff; --text:#1c2430; --muted:#6b7683; --line:#e3e7ec; --brand:#2f6fed; --ok:#17803d; --bad:#c62828; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#12161c; --card:#1b212a; --text:#e8ecf1; --muted:#97a3b1; --line:#2c3541; --brand:#6b9bff; --ok:#4cc27a; --bad:#ff7b7b; }
+  }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--text); font:16px/1.5 system-ui, sans-serif; }
+  main { max-width: 760px; margin: 0 auto; padding: 24px 16px 64px; }
+  h1 { margin: 0 0 16px; font-size: 24px; }
+  h2 { margin: 0 0 12px; font-size: 17px; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:12px; padding:16px; margin-bottom:16px; }
+  .row { display:flex; gap:8px; flex-wrap:wrap; align-items:center; }
+  input, select, button { font:inherit; padding:8px 10px; border-radius:8px; border:1px solid var(--line); background:var(--bg); color:var(--text); }
+  input { flex:1 1 140px; min-width:0; }
+  button { background:var(--brand); color:#fff; border-color:transparent; cursor:pointer; }
+  button.ghost { background:transparent; color:var(--text); border-color:var(--line); }
+  button:disabled { opacity:.5; cursor:default; }
+  .balance { font-size: 36px; font-weight: 700; margin: 4px 0 12px; }
+  .muted { color:var(--muted); font-size:14px; }
+  #msg { min-height: 24px; margin-bottom: 12px; font-weight: 600; }
+  #msg.ok { color:var(--ok); } #msg.err { color:var(--bad); }
+  table { width:100%; border-collapse:collapse; font-size:14px; }
+  th, td { text-align:left; padding:8px 6px; border-bottom:1px solid var(--line); }
+  .credit { color:var(--ok); font-weight:600; } .debit { color:var(--bad); font-weight:600; }
+  .table-wrap { overflow-x:auto; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Transaction Ledger</h1>
+  <div id="msg" role="status"></div>
+
+  <section class="card">
+    <h2>1. Accounts</h2>
+    <form id="create-form" class="row">
+      <input id="new-name" placeholder="Account holder name" required>
+      <button>Create account</button>
+    </form>
+    <div class="row" style="margin-top:12px">
+      <select id="account-select" aria-label="Choose account"></select>
+    </div>
+    <p class="muted">The API has no "list accounts" endpoint, so this browser remembers the accounts you created.</p>
+  </section>
+
+  <section class="card" id="account-card" hidden>
+    <h2 id="account-title"></h2>
+    <div class="balance" id="balance">0.00</div>
+
+    <form id="tx-form" class="row">
+      <select id="tx-type" aria-label="Type"><option value="credit">Credit (add)</option><option value="debit">Debit (take out)</option></select>
+      <input id="tx-amount" type="number" step="0.01" min="0.01" placeholder="Amount" required>
+      <input id="tx-desc" placeholder="Description">
+      <button>Add</button>
+    </form>
+    <p class="muted">A unique reference_id is generated for each click. Use "Send same again" to see duplicate protection.</p>
+    <button class="ghost" id="resend" type="button" disabled>Send same again</button>
+  </section>
+
+  <section class="card" id="transfer-card" hidden>
+    <h2>2. Transfer money</h2>
+    <form id="transfer-form" class="row">
+      <select id="transfer-to" aria-label="To account"></select>
+      <input id="transfer-amount" type="number" step="0.01" min="0.01" placeholder="Amount" required>
+      <button>Send</button>
+    </form>
+    <p class="muted" id="transfer-hint">Create a second account to enable transfers.</p>
+  </section>
+
+  <section class="card" id="history-card" hidden>
+    <h2>3. History (newest first)</h2>
+    <div class="row">
+      <select id="filter" aria-label="Filter">
+        <option value="">All</option><option value="credit">Credits</option><option value="debit">Debits</option>
+      </select>
+      <button class="ghost" id="prev" type="button">Prev</button>
+      <span id="page-info" class="muted"></span>
+      <button class="ghost" id="next" type="button">Next</button>
+    </div>
+    <div class="table-wrap"><table>
+      <thead><tr><th>Time</th><th>Type</th><th>Amount</th><th>Description</th><th>Reference</th></tr></thead>
+      <tbody id="rows"></tbody>
+    </table></div>
+  </section>
+</main>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const LIMIT = 5;
+let accounts = load();           // [{id, name}]
+let current = null;              // selected account id
+let page = 1;
+let lastTx = null;               // body of the last transaction sent, for "Send same again"
+
+function load() { try { return JSON.parse(localStorage.getItem('accounts')) || []; } catch { return []; } }
+function save() { try { localStorage.setItem('accounts', JSON.stringify(accounts)); } catch {} }
+const money = (n) => Number(n).toFixed(2);
+
+function say(text, ok) { const m = $('msg'); m.textContent = text; m.className = ok ? 'ok' : 'err'; }
+
+async function api(method, path, body) {
+  const res = await fetch(path, {
+    method,
+    headers: { 'content-type': 'application/json' },
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    const e = new Error(data.error ? data.error.message : 'Request failed');
+    e.code = data.error && data.error.code;
+    throw e;
+  }
+  return data;
+}
+
+function renderAccounts() {
+  const sel = $('account-select');
+  sel.replaceChildren(...accounts.map((a) => new Option(a.name, a.id)));
+  if (!accounts.length) sel.replaceChildren(new Option('No accounts yet', ''));
+  if (current && accounts.some((a) => a.id === current)) sel.value = current;
+  else current = accounts[0] ? accounts[0].id : null;
+  const show = !!current;
+  ['account-card', 'transfer-card', 'history-card'].forEach((id) => ($(id).hidden = !show));
+  const others = accounts.filter((a) => a.id !== current);
+  $('transfer-to').replaceChildren(...others.map((a) => new Option(a.name, a.id)));
+  $('transfer-to').disabled = $('transfer-amount').disabled = !others.length;
+  $('transfer-hint').hidden = others.length > 0;
+  if (show) refresh();
+}
+
+async function refresh() {
+  if (!current) return;
+  const acc = accounts.find((a) => a.id === current);
+  $('account-title').textContent = acc.name;
+  try {
+    const [bal, hist] = await Promise.all([
+      api('GET', `/accounts/${current}/balance`),
+      api('GET', `/accounts/${current}/transactions?page=${page}&limit=${LIMIT}` + ($('filter').value ? `&type=${$('filter').value}` : '')),
+    ]);
+    $('balance').textContent = money(bal.balance);
+    const { page: p, total, total_pages } = hist.pagination;
+    $('page-info').textContent = `Page ${p} of ${Math.max(total_pages, 1)} (${total} total)`;
+    $('prev').disabled = p <= 1;
+    $('next').disabled = p >= total_pages;
+    $('rows').replaceChildren(...hist.data.map((t) => {
+      const tr = document.createElement('tr');
+      const cells = [new Date(t.created_at).toLocaleString(), t.type, money(t.amount), t.description, t.reference_id];
+      cells.forEach((text, i) => {
+        const td = document.createElement('td');
+        td.textContent = text;          // textContent (not innerHTML) so user text can't inject HTML
+        if (i === 1) td.className = t.type;
+        tr.appendChild(td);
+      });
+      return tr;
+    }));
+  } catch (e) { say(e.message, false); }
+}
+
+$('create-form').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  try {
+    const a = await api('POST', '/accounts', { name: $('new-name').value });
+    accounts.push({ id: a.id, name: a.name }); save();
+    current = a.id; page = 1; $('new-name').value = '';
+    say(`Created account for ${a.name} with balance 0.00`, true);
+    renderAccounts();
+  } catch (err) { say(err.message, false); }
+});
+
+$('account-select').addEventListener('change', (e) => { current = e.target.value; page = 1; lastTx = null; $('resend').disabled = true; renderAccounts(); });
+$('filter').addEventListener('change', () => { page = 1; refresh(); });
+$('prev').addEventListener('click', () => { page--; refresh(); });
+$('next').addEventListener('click', () => { page++; refresh(); });
+
+async function sendTx(body) {
+  try {
+    const r = await api('POST', `/accounts/${current}/transactions`, body);
+    say(`${body.type} of ${money(body.amount)} done. New balance: ${money(r.balance)}`, true);
+    page = 1;
+  } catch (err) {
+    say(err.code === 'DUPLICATE_TRANSACTION' ? 'Already recorded (same reference_id). Balance unchanged.' : err.message, false);
+  }
+  refresh();
+}
+
+$('tx-form').addEventListener('submit', (e) => {
+  e.preventDefault();
+  lastTx = {
+    type: $('tx-type').value,
+    amount: Number($('tx-amount').value),
+    description: $('tx-desc').value,
+    reference_id: crypto.randomUUID(),
+  };
+  $('resend').disabled = false;
+  sendTx(lastTx);
+});
+$('resend').addEventListener('click', () => lastTx && sendTx(lastTx));
+
+$('transfer-form').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  try {
+    await api('POST', '/transfers', {
+      from_account_id: current,
+      to_account_id: $('transfer-to').value,
+      amount: Number($('transfer-amount').value),
+      reference_id: crypto.randomUUID(),
+    });
+    say('Transfer complete', true);
+    page = 1; refresh();
+  } catch (err) { say(err.message, false); }
+});
+
+renderAccounts();
+</script>
+</body>
+</html>
